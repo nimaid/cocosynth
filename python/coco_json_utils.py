@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 
 import numpy as np
 import json
@@ -336,7 +336,8 @@ class CocoJsonCreator():
         # Write the json to a file
         output_path = Path(self.dataset_dir) / 'coco_instances.json'
         with open(output_path, 'w+') as output_file:
-            json.dump(master_obj, output_file)
+            json_pretty_string = json.dumps(master_obj, indent=2)
+            output_file.write(json_pretty_string)
 
         print(f'Annotations successfully written to file:\n{output_path}')
 

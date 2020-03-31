@@ -7,7 +7,7 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageOps
 
 class MaskJsonUtils():
     """ Creates a JSON definition file for image masks.
@@ -114,7 +114,7 @@ class ImageComposition():
         self.allowed_output_types = ['.png', '.jpg', '.jpeg']
         self.allowed_background_types = ['.png', '.jpg', '.jpeg']
         self.zero_padding = 8 # 00000027.png, supports up to 100 million images
-        self.max_foregrounds = 3
+        self.max_foregrounds = 1
         self.mask_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
         assert len(self.mask_colors) >= self.max_foregrounds, 'length of mask_colors should be >= max_foregrounds'
 
@@ -189,9 +189,9 @@ class ImageComposition():
         #     + super_category_dir
         #         + category_dir
         #             + foreground_image.png
-
+        
         self.foregrounds_dict = dict()
-
+        
         for super_category_dir in self.foregrounds_dir.iterdir():
             if not super_category_dir.is_dir():
                 warnings.warn(f'file found in foregrounds directory (expected super-category directories), ignoring: {super_category_dir}')
@@ -202,16 +202,37 @@ class ImageComposition():
                 if not category_dir.is_dir():
                     warnings.warn(f'file found in super category directory (expected category directories), ignoring: {category_dir}')
                     continue
-
+                masks_used = False
                 # This is a category directory
+                # Is there a masks directory?
+                for image_file in category_dir.iterdir():
+                    if image_file.is_dir():
+                        if image_file.stem == 'masks':
+                            masks_used = True
+                            print('\'masks\' dir found, using pre-made foreground masks for class \'{}\''.format(image_file.parents[0].stem))
+                            break
+                    
                 for image_file in category_dir.iterdir():
                     if not image_file.is_file():
+                        if image_file.is_dir():
+                            # Ignore completely, do not wark of masks dir
+                            if image_file.stem == 'masks':
+                                continue
                         warnings.warn(f'a directory was found inside a category directory, ignoring: {str(image_file)}')
                         continue
                     if image_file.suffix != '.png':
                         warnings.warn(f'foreground must be a .png file, skipping: {str(image_file)}')
                         continue
-
+                    
+                    image_dict = {'image': image_file, 'mask': None}
+                    if masks_used:
+                        mask_file = image_file.parents[0] / 'masks' / image_file.name
+                        if not mask_file.is_file():
+                            warnings.warn(f'mask not found for {str(mask_file)}, skipping...')
+                            continue
+                        else:
+                            image_dict['mask'] = mask_file
+                    
                     # Valid foreground image, add to foregrounds_dict
                     super_category = super_category_dir.name
                     category = category_dir.name
@@ -222,8 +243,8 @@ class ImageComposition():
                     if category not in self.foregrounds_dict[super_category]:
                         self.foregrounds_dict[super_category][category] = []
 
-                    self.foregrounds_dict[super_category][category].append(image_file)
-
+                    self.foregrounds_dict[super_category][category].append(image_dict)
+        
         assert len(self.foregrounds_dict) > 0, 'no valid foregrounds were found'
 
     def _validate_and_process_backgrounds(self):
@@ -261,15 +282,15 @@ class ImageComposition():
                 # Randomly choose a foreground
                 super_category = random.choice(list(self.foregrounds_dict.keys()))
                 category = random.choice(list(self.foregrounds_dict[super_category].keys()))
-                foreground_path = random.choice(self.foregrounds_dict[super_category][category])
-
+                foreground_dict = random.choice(self.foregrounds_dict[super_category][category])
+                
                 # Get the color
                 mask_rgb_color = self.mask_colors[fg_i]
 
                 foregrounds.append({
                     'super_category':super_category,
                     'category':category,
-                    'foreground_path':foreground_path,
+                    'foreground_dict':foreground_dict,
                     'mask_rgb_color':mask_rgb_color
                 })
 
@@ -325,7 +346,18 @@ class ImageComposition():
         # Returns:
         #     composite: the composed image
         #     mask: the mask image
-
+        
+        def get_alpha(image_in, size=None, paste_position=None):
+            # Extract the alpha channel from the foreground and paste it into a new image the size of the composite
+            alpha_mask = image_in.getchannel(3)
+            if size == None:
+                new_size = image_in.size
+            else:
+                new_size = size
+            new_alpha_mask = Image.new('L', new_size, color = 0)
+            new_alpha_mask.paste(alpha_mask, paste_position)
+            return new_alpha_mask
+        
         # Open background and convert to RGBA
         background = Image.open(background_path)
         background = background.convert('RGBA')
@@ -342,31 +374,97 @@ class ImageComposition():
         composite_mask = Image.new('RGB', composite.size, 0)
 
         for fg in foregrounds:
-            fg_path = fg['foreground_path']
+            
+            fg_dict = fg['foreground_dict']
+            fg_path = fg_dict['image']
+            fg_mask_path = fg_dict['mask']
+            
+            # Is a seperate mask file used (not alpha channel)?
+            if fg_mask_path == None:
+                uses_mask = False
+            else:
+                uses_mask = True
+                
+            
+             # ** Apply Transformations **
+            rot_jitter = 10  # degrees
+            scale_range = (0.9, 1.1)  # percent
+            bright_range = (.7, 1.1)
+            pos_jitter = (20, 10)  # pixels
+            
+            t_params = dict()
+        
+            # Get center point
+            # Get monocrome image from fg alpha, non-white = mass
+            pretransform_alpha_image = Image.open(fg_path)
+            pretransform_alpha_mask = get_alpha(pretransform_alpha_image)
+            pretransform_alpha_mask_threshold = 127
+            pretransform_alpha_thresh = pretransform_alpha_mask.point(lambda p:p > pretransform_alpha_mask_threshold and 255)
+            pretransform_alpha_thresh = ImageOps.invert(pretransform_alpha_thresh)
+            pretransform_alpha_thresh = pretransform_alpha_thresh.convert(mode='RGB')
+            # Get center of mass (rotation center)
+            mass = np.sum(np.asarray(pretransform_alpha_thresh), -1) < 255*3
+            mass = mass / np.sum(np.sum(mass))
+            mass_center_dx = np.sum(mass, 0)
+            mass_center_dy = np.sum(mass, 1)
+            t_params['center'] = dict()
+            t_params['center']['X'] = np.sum(mass_center_dx * np.arange(pretransform_alpha_thresh.size[0]))
+            t_params['center']['Y'] = np.sum(mass_center_dy * np.arange(pretransform_alpha_thresh.size[1]))
+            
+            # Add rotation jitter
+            t_params['rotation'] = random.randint(-rot_jitter, rot_jitter)
 
+            # Scale the foreground
+            t_params['scale'] = random.uniform(scale_range[0], scale_range[1])
+
+            # Adjust foreground brightness
+            t_params['brightness'] = random.uniform(bright_range[0], bright_range[1])
+            
+            # Add some positional jitter
+            t_params['translate'] = dict()
+            t_params['translate']['X'] = random.randint(-pos_jitter[0], pos_jitter[0])
+            t_params['translate']['Y'] = random.randint(-pos_jitter[1], pos_jitter[1])
+            
+            # Randomly decide if either axis should be flipped
+            t_params['flip'] = dict()
+            t_params['flip']['X'] = random.choice((True, False))
+            t_params['flip']['Y'] = random.choice((True, False))
+            
+            # Add any other transformations here...
+            
+            
             # Perform transformations
-            fg_image = self._transform_foreground(fg, fg_path)
+            fg_image = self._transform_foreground(fg, fg_path, t_params, is_mask=False)
+            if uses_mask:
+                fg_image_mask = self._transform_foreground(fg, fg_mask_path, t_params, is_mask=True)
 
-            # Choose a random x,y position for the foreground
+            # Checks (is for kids)
             max_x_position = composite.size[0] - fg_image.size[0]
             max_y_position = composite.size[1] - fg_image.size[1]
             assert max_x_position >= 0 and max_y_position >= 0, \
             f'foreground {fg_path} is too big ({fg_image.size[0]}x{fg_image.size[1]}) for the requested output size ({self.width}x{self.height}), check your input parameters'
-            paste_position = (random.randint(0, max_x_position), random.randint(0, max_y_position))
 
             # Create a new foreground image as large as the composite and paste it on top
             new_fg_image = Image.new('RGBA', composite.size, color = (0, 0, 0, 0))
-            new_fg_image.paste(fg_image, paste_position)
-
+            new_fg_image.paste(fg_image)
+            
             # Extract the alpha channel from the foreground and paste it into a new image the size of the composite
-            alpha_mask = fg_image.getchannel(3)
-            new_alpha_mask = Image.new('L', composite.size, color = 0)
-            new_alpha_mask.paste(alpha_mask, paste_position)
+            new_alpha_mask = get_alpha(fg_image, size=composite.size)
             composite = Image.composite(new_fg_image, composite, new_alpha_mask)
-
+            
+            # Extract mask alpha, if applicable
+            if uses_mask:
+                mask_alpha_mask = fg_image_mask.getchannel(3)
+                new_mask_alpha_mask = Image.new('L', composite.size, color = 0)
+                new_mask_alpha_mask.paste(mask_alpha_mask)
+            
             # Grab the alpha pixels above a specified threshold
             alpha_threshold = 200
-            mask_arr = np.array(np.greater(np.array(new_alpha_mask), alpha_threshold), dtype=np.uint8)
+            if uses_mask:
+                alpha_mask_to_use = new_mask_alpha_mask
+            else:
+                alpha_mask_to_use = new_alpha_mask
+            mask_arr = np.array(np.greater(np.array(alpha_mask_to_use), alpha_threshold), dtype=np.uint8)
             uint8_mask = np.uint8(mask_arr) # This is composed of 1s and 0s
 
             # Multiply the mask value (1 or 0) by the color in each RGB channel and combine to get the mask
@@ -381,30 +479,80 @@ class ImageComposition():
             composite_mask = Image.composite(isolated_mask, composite_mask, isolated_alpha)
 
         return composite, composite_mask
-
-    def _transform_foreground(self, fg, fg_path):
+    
+    def _transform_image_from_parameters(self, image_in, params_in, is_mask=False):
+        image_out = image_in.copy()
+       
+        def check_for_param(p_in):
+            if p_in in params_in:
+                if params_in[p_in] != None:
+                    return True
+            return False
+        
+        # Flip image if applicable
+        if check_for_param('flip'):
+            if params_in['flip']['X']:
+                image_out = ImageOps.mirror(image_out)
+            if params_in['flip']['Y']:
+                image_out = ImageOps.flip(image_out)
+                    
+        # Transform center to real center (if not None)
+        if check_for_param('center'):
+            w = image_out.size[0]
+            h = image_out.size[1]
+            # Check for flips and adjust centers if needed
+            if check_for_param('flip'):
+                if params_in['flip']['X']:
+                    x = w - params_in['center']['X']
+                else:
+                    x = params_in['center']['X']
+                if params_in['flip']['Y']:
+                    y = h - params_in['center']['Y']
+                else:
+                    y = params_in['center']['Y']
+            else:
+                x = params_in['center']['X']
+                y = params_in['center']['Y']
+            dx = (w / 2) - (w - x)
+            dy = (h / 2) - (h - y) 
+            image_out = image_out.transform(image_out.size, Image.AFFINE, (1, 0, dx, 0, 1, dy))
+        
+        # Do Transforms
+        if check_for_param('scale'):
+            new_size = (int(image_out.size[0] * params_in['scale']), int(image_out.size[1] * params_in['scale']))
+            image_out = image_out.resize(new_size, resample=Image.BICUBIC)
+        if check_for_param('rotation'):
+            image_out = image_out.rotate(params_in['rotation'], resample=Image.BICUBIC, expand=True)
+        if check_for_param('brightness'):
+            if not is_mask:
+                enhancer = ImageEnhance.Brightness(image_out)
+                image_out = enhancer.enhance(params_in['brightness'])
+        
+        
+        
+        # Add any other transformations here...
+        
+        # Adjust final dx and dy by translate
+        final_dx = dx
+        final_dy = dy
+        if check_for_param('translate'):
+            final_dx += params_in['translate']['X']
+            final_dy += params_in['translate']['Y']
+        
+        # Transform back to original position
+        if check_for_param('center'):
+            image_out = image_out.transform(image_out.size, Image.AFFINE, (1, 0, -final_dx, 0, 1, -final_dy))
+        
+        image_out = image_out.crop((0, 0, image_in.size[0], image_in.size[1]))
+        return image_out
+    
+    def _transform_foreground(self, fg, fg_path, params_in, is_mask=False):
         # Open foreground and get the alpha channel
         fg_image = Image.open(fg_path)
         fg_alpha = np.array(fg_image.getchannel(3))
         assert np.any(fg_alpha == 0), f'foreground needs to have some transparency: {str(fg_path)}'
-
-        # ** Apply Transformations **
-        # Rotate the foreground
-        angle_degrees = random.randint(0, 359)
-        fg_image = fg_image.rotate(angle_degrees, resample=Image.BICUBIC, expand=True)
-
-        # Scale the foreground
-        scale = random.random() * .5 + .5 # Pick something between .5 and 1
-        new_size = (int(fg_image.size[0] * scale), int(fg_image.size[1] * scale))
-        fg_image = fg_image.resize(new_size, resample=Image.BICUBIC)
-
-        # Adjust foreground brightness
-        brightness_factor = random.random() * .4 + .7 # Pick something between .7 and 1.1
-        enhancer = ImageEnhance.Brightness(fg_image)
-        fg_image = enhancer.enhance(brightness_factor)
-
-        # Add any other transformations here...
-
+        
+        fg_image = self._transform_image_from_parameters(fg_image, params_in, is_mask)
         return fg_image
 
     def _create_info(self):
